@@ -61,6 +61,7 @@ fn app() -> Html {
     let upgraded_settings_and_hydrated_form = use_state(|| false);
     if !*upgraded_settings_and_hydrated_form {
         app_dispatch.reduce_mut(|app| {
+            app.migrate();
             if app.settings.try_upgrade().is_err() {
                 unreachable!("No breaking upgrades yet!")
             }

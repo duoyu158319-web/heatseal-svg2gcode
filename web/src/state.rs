@@ -167,7 +167,7 @@ impl Default for HeatSealSettings {
         Self {
             dwell_seconds: 120.,
             temperature: 230.,
-            working_height: 1.2,
+            working_height: 0.12,
         }
     }
 }
@@ -284,6 +284,8 @@ mod tests {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Store)]
 #[store(storage = "local", storage_tab_sync)]
 pub struct AppState {
+    #[serde(default)]
+    pub storage_version: u32,
     pub first_visit: bool,
     pub settings: Settings,
     #[serde(default)]
@@ -322,6 +324,7 @@ pub struct GCodeTemplate {
 impl Default for AppState {
     fn default() -> Self {
         Self {
+            storage_version: APP_STATE_STORAGE_VERSION,
             first_visit: true,
             settings: Settings::default(),
             heat_seal: HeatSealSettings::default(),
@@ -330,5 +333,44 @@ impl Default for AppState {
             replacement_svg: None,
             gcode_template: None,
         }
+    }
+}
+
+const APP_STATE_STORAGE_VERSION: u32 = 1;
+const LEGACY_DEFAULT_WORKING_HEIGHT: f64 = 1.2;
+
+impl AppState {
+    pub fn migrate(&mut self) {
+        if self.storage_version < 1 {
+            if self.heat_seal.working_height == LEGACY_DEFAULT_WORKING_HEIGHT {
+                self.heat_seal.working_height = HeatSealSettings::default().working_height;
+            }
+            self.storage_version = 1;
+        }
+    }
+}
+
+#[cfg(test)]
+mod app_state_tests {
+    use super::*;
+
+    #[test]
+    fn heat_seal_default_working_height_is_point_twelve_mm() {
+        assert_eq!(HeatSealSettings::default().working_height, 0.12);
+    }
+
+    #[test]
+    fn migrates_the_legacy_default_height_but_preserves_custom_values() {
+        let mut legacy_default = AppState::default();
+        legacy_default.storage_version = 0;
+        legacy_default.heat_seal.working_height = LEGACY_DEFAULT_WORKING_HEIGHT;
+        legacy_default.migrate();
+        assert_eq!(legacy_default.heat_seal.working_height, 0.12);
+
+        let mut custom = AppState::default();
+        custom.storage_version = 0;
+        custom.heat_seal.working_height = 0.8;
+        custom.migrate();
+        assert_eq!(custom.heat_seal.working_height, 0.8);
     }
 }
