@@ -1,0 +1,349 @@
+use std::{collections::HashMap, fmt::Debug};
+
+use lyon_geom::euclid::default::Transform2D;
+use roxmltree::{Document, Node};
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+use svgtypes::Length;
+use uom::si::{
+    f64::Length as UomLength,
+    length::{inch, millimeter},
+};
+
+use self::units::CSS_DEFAULT_DPI;
+use crate::{
+    lower::selector::SelectorList,
+    turtle::{
+        CoordinateSystem, DpiConvertingTurtle, PreprocessTurtle, StrokeCollectingTurtle, Terrarium,
+        Turtle,
+        elements::{Stroke, minimize_travel_time},
+    },
+};
+
+#[cfg(feature = "serde")]
+mod length_serde;
+mod selector;
+mod transform;
+mod units;
+mod visit;
+
+/// High-level output configuration
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
+pub struct ConversionConfig {
+    /// Dots per inch for pixels, picas, points, etc.
+    pub dpi: f64,
+    /// Set the origin point in millimeters for this conversion
+    pub origin: [Option<f64>; 2],
+    /// Set extra attribute to add when printing node name
+    pub extra_attribute_name: Option<String>,
+    /// Reorder paths to minimize travel time
+    pub optimize_path_order: bool,
+    /// CSS selector to filter which SVG elements are converted.
+    ///
+    /// Only the `:not`, `:is`, and `:has` pseudo classes are supported.
+    ///
+    /// <https://developer.mozilla.org/en-US/docs/Web/CSS/Guides/Selectors>
+    pub selector_filter: Option<String>,
+    pub starting_point: [Option<f64>; 2],
+}
+
+const fn zero_origin() -> [Option<f64>; 2] {
+    [Some(0.); 2]
+}
+
+impl Default for ConversionConfig {
+    fn default() -> Self {
+        Self {
+            dpi: 96.0,
+            origin: zero_origin(),
+            extra_attribute_name: None,
+            optimize_path_order: false,
+            selector_filter: None,
+            starting_point: zero_origin(),
+        }
+    }
+}
+
+/// Options are specific to this conversion.
+///
+/// This is separate from [ConversionConfig] to support bulk processing in the web interface.
+#[derive(Debug, Clone, PartialEq, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct ConversionOptions {
+    /// Width and height override
+    ///
+    /// Useful when an SVG does not have a set width and height or you want to override it.
+    #[cfg_attr(feature = "serde", serde(with = "length_serde"))]
+    pub dimensions: [Option<Length>; 2],
+}
+
+/// Maps SVG [`Node`]s and their attributes into operations on a [`Terrarium`]
+#[derive(Debug)]
+struct ConversionVisitor<'a, 'input, T: Turtle> {
+    terrarium: Terrarium<T>,
+    /// Whether to flip the Y axis to convert from SVG (Y-down) to the output coordinate system.
+    coordinate_system: CoordinateSystem,
+    name_stack: Vec<String>,
+    /// Used to convert percentage values
+    viewport_dim_stack: Vec<[f64; 2]>,
+    config: &'a ConversionConfig,
+    options: ConversionOptions,
+    /// Parsed CSS include selector — only draw elements that match (or are inside a matching ancestor)
+    selector_filter: Option<selector::SelectorList>,
+    /// Resolved CSS class rules
+    css_rules: HashMap<&'input str, HashMap<&'input str, &'input str>>,
+}
+
+impl<'a, 'input, T: Turtle> ConversionVisitor<'a, 'input, T> {
+    fn comment(&mut self) {
+        let mut comment = String::new();
+        self.name_stack
+            .iter()
+            // Predecessors only
+            .take(self.name_stack.len().saturating_sub(1))
+            .for_each(|name| {
+                comment += name;
+                comment += " > ";
+            });
+        if let Some(name) = self.name_stack.last() {
+            comment += name;
+        }
+
+        self.terrarium.comment(comment);
+    }
+
+    fn should_draw_node(&self, node: Node) -> bool {
+        self.selector_filter
+            .as_ref()
+            .is_none_or(|s| s.matches(node))
+    }
+
+    fn begin(&mut self) {
+        if self.coordinate_system == CoordinateSystem::YUp {
+            // Part 1 of converting from SVG (Y-down) to output (Y-up) coordinates
+            self.terrarium.push_transform(Transform2D::scale(1., -1.));
+        }
+    }
+
+    fn end(&mut self) {
+        if self.coordinate_system == CoordinateSystem::YUp {
+            self.terrarium.pop_transform();
+        }
+    }
+}
+
+/// Drives any [`Turtle`] implementation through the full SVG conversion pipeline.
+///
+/// This is the generic entry point for custom backends. The turtle receives resolved,
+/// absolute, world-space geometry in millimeters after all SVG transforms, DPI conversion,
+/// and optional origin alignment have been applied.
+///
+/// Path optimization (TSP reordering) is applied automatically when
+/// [`ConversionConfig::optimize_path_order`] is `true`.
+///
+/// The turtle is returned so callers can extract its internal state (e.g. generated output).
+pub fn svg_to_turtle<T: Turtle>(
+    doc: &Document,
+    config: &ConversionConfig,
+    options: ConversionOptions,
+    turtle: T,
+    coordinate_system: CoordinateSystem,
+) -> T {
+    let selector_filter = config
+        .selector_filter
+        .as_deref()
+        .map(|s| selector::SelectorList::parse(s).expect("invalid selector_filter"));
+
+    let bounding_box_generator = || {
+        let mut visitor = ConversionVisitor {
+            terrarium: Terrarium::new(DpiConvertingTurtle::new(
+                config.dpi,
+                PreprocessTurtle::default(),
+            )),
+            coordinate_system,
+            config,
+            options: options.clone(),
+            name_stack: vec![],
+            viewport_dim_stack: vec![],
+            selector_filter: selector_filter.clone(),
+            css_rules: visit::parse_css(doc),
+        };
+
+        visitor.begin();
+        visit::depth_first_visit(doc, &mut visitor);
+        visitor.end();
+
+        visitor.terrarium.finish().into_inner().into_inner()
+    };
+
+    // Convert from millimeters to user units
+    let origin = config
+        .origin
+        .map(|dim| dim.map(|d| UomLength::new::<millimeter>(d).get::<inch>() * CSS_DEFAULT_DPI));
+
+    // Convert from millimeters to user units
+    let starting_point = config
+        .starting_point
+        .map(|dim| dim.map(|d| UomLength::new::<millimeter>(d).get::<inch>() * CSS_DEFAULT_DPI));
+
+    let origin_transform = match origin {
+        [None, Some(origin_y)] => {
+            let bb = bounding_box_generator();
+            Transform2D::translation(0., origin_y - bb.min.y)
+        }
+        [Some(origin_x), None] => {
+            let bb = bounding_box_generator();
+            Transform2D::translation(origin_x - bb.min.x, 0.)
+        }
+        [Some(origin_x), Some(origin_y)] => {
+            let bb = bounding_box_generator();
+            Transform2D::translation(origin_x - bb.min.x, origin_y - bb.min.y)
+        }
+        [None, None] => Transform2D::identity(),
+    };
+
+    let mut conversion_visitor = ConversionVisitor {
+        terrarium: Terrarium::new(DpiConvertingTurtle::new(config.dpi, turtle)),
+        coordinate_system,
+        config,
+        options: options.clone(),
+        name_stack: vec![],
+        viewport_dim_stack: vec![],
+        selector_filter: selector_filter.clone(),
+        css_rules: visit::parse_css(doc),
+    };
+
+    conversion_visitor
+        .terrarium
+        .push_transform(origin_transform);
+    conversion_visitor.begin();
+
+    if config.optimize_path_order {
+        let strokes = svg_to_optimized_strokes(
+            doc,
+            config,
+            options,
+            origin_transform,
+            selector_filter,
+            coordinate_system,
+            starting_point,
+        );
+        conversion_visitor.terrarium.apply_strokes(strokes);
+    } else {
+        visit::depth_first_visit(doc, &mut conversion_visitor);
+    }
+
+    conversion_visitor.end();
+    conversion_visitor.terrarium.pop_transform();
+
+    conversion_visitor.terrarium.finish().into_inner()
+}
+
+fn svg_to_optimized_strokes(
+    doc: &Document,
+    config: &ConversionConfig,
+    options: ConversionOptions,
+    origin_transform: Transform2D<f64>,
+    selector_filter: Option<SelectorList>,
+    coordinate_system: CoordinateSystem,
+    starting_point: [Option<f64>; 2],
+) -> Vec<Stroke> {
+    let mut collect_visitor = ConversionVisitor {
+        terrarium: Terrarium::new(StrokeCollectingTurtle::default()),
+        coordinate_system,
+        config,
+        options,
+        name_stack: vec![],
+        viewport_dim_stack: vec![],
+        selector_filter,
+        css_rules: visit::parse_css(doc),
+    };
+    collect_visitor.terrarium.push_transform(origin_transform);
+    collect_visitor.begin();
+    visit::depth_first_visit(doc, &mut collect_visitor);
+    collect_visitor.end();
+    collect_visitor.terrarium.pop_transform();
+    let strokes = collect_visitor.terrarium.finish().into_strokes();
+    minimize_travel_time(strokes, starting_point)
+}
+
+fn node_name(node: &Node, attr_to_print: &Option<String>) -> String {
+    let mut name = node.tag_name().name().to_string();
+    if let Some(id) = node.attribute("id") {
+        name += "#";
+        name += id;
+        if let Some(extra_attr_to_print) = attr_to_print {
+            for a_attr in node.attributes() {
+                if a_attr.name() == extra_attr_to_print {
+                    name += " ( ";
+                    name += a_attr.value();
+                    name += " ) ";
+                }
+            }
+        }
+    }
+    name
+}
+
+#[cfg(all(test, feature = "serde"))]
+mod test {
+    use svgtypes::LengthUnit;
+
+    use super::*;
+
+    #[test]
+    fn serde_conversion_options_is_correct() {
+        let default_struct = ConversionOptions::default();
+        let default_json = r#"{"dimensions":[null,null]}"#;
+
+        assert_eq!(
+            serde_json::to_string(&default_struct).unwrap(),
+            default_json
+        );
+        assert_eq!(
+            serde_json::from_str::<ConversionOptions>(default_json).unwrap(),
+            default_struct
+        );
+    }
+
+    #[test]
+    fn serde_conversion_options_with_single_dimension_is_correct() {
+        let mut r#struct = ConversionOptions::default();
+        r#struct.dimensions[0] = Some(Length {
+            number: 4.,
+            unit: LengthUnit::Mm,
+        });
+        let json = r#"{"dimensions":[{"number":4.0,"unit":"Mm"},null]}"#;
+
+        assert_eq!(serde_json::to_string(&r#struct).unwrap(), json);
+        assert_eq!(
+            serde_json::from_str::<ConversionOptions>(json).unwrap(),
+            r#struct
+        );
+    }
+
+    #[test]
+    fn serde_conversion_options_with_both_dimensions_is_correct() {
+        let r#struct = ConversionOptions {
+            dimensions: [
+                Some(Length {
+                    number: 4.,
+                    unit: LengthUnit::Mm,
+                }),
+                Some(Length {
+                    number: 10.5,
+                    unit: LengthUnit::In,
+                }),
+            ],
+        };
+        let json = r#"{"dimensions":[{"number":4.0,"unit":"Mm"},{"number":10.5,"unit":"In"}]}"#;
+
+        assert_eq!(serde_json::to_string(&r#struct).unwrap(), json);
+        assert_eq!(
+            serde_json::from_str::<ConversionOptions>(json).unwrap(),
+            r#struct
+        );
+    }
+}

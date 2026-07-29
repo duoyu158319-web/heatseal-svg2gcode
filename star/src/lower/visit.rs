@@ -1,0 +1,709 @@
+use std::{collections::HashMap, str::FromStr};
+
+use euclid::default::Transform2D;
+use log::{debug, warn};
+use lyon_geom::{Box2D, Point};
+use roxmltree::{Document, Node};
+use svgtypes::{
+    AspectRatio, LengthListParser, PathParser, PathSegment, PointsParser, TransformListParser,
+    ViewBox,
+};
+
+use super::{
+    ConversionVisitor,
+    transform::{get_viewport_transform, svg_transform_into_euclid_transform},
+    units::DimensionHint,
+};
+use crate::{
+    lower::node_name,
+    turtle::{CoordinateSystem, Turtle, elements::FillRule},
+};
+
+const SVG_TAG_NAME: &str = "svg";
+const CLIP_PATH_TAG_NAME: &str = "clipPath";
+const PATH_TAG_NAME: &str = "path";
+const POLYLINE_TAG_NAME: &str = "polyline";
+const POLYGON_TAG_NAME: &str = "polygon";
+const RECT_TAG_NAME: &str = "rect";
+const CIRCLE_TAG_NAME: &str = "circle";
+const ELLIPSE_TAG_NAME: &str = "ellipse";
+const LINE_TAG_NAME: &str = "line";
+const GROUP_TAG_NAME: &str = "g";
+const DEFS_TAG_NAME: &str = "defs";
+const USE_TAG_NAME: &str = "use";
+const MARKER_TAG_NAME: &str = "marker";
+const SYMBOL_TAG_NAME: &str = "symbol";
+
+pub trait XmlVisitor {
+    fn visit_enter(&mut self, node: Node);
+    fn visit_exit(&mut self, node: Node);
+}
+
+/// Returns the effective value of the given presentation attribute (i.e. stroke),
+/// adhering to precedence rules.
+///
+/// 1. Inline style attribute
+/// 2. CSS class rules
+/// 3. Presentation attribute.
+fn calculate_presentation_attr<'input>(
+    node: Node<'input, 'input>,
+    name: &'input str,
+    css_rules: &HashMap<&'input str, HashMap<&'input str, &'input str>>,
+) -> Option<&'input str> {
+    if let Some(style) = node.attribute("style") {
+        let v = style.split(';').find_map(|decl| {
+            let (k, v) = decl.split_once(':')?;
+            (k.trim() == name).then(|| v.trim())
+        });
+        if v.is_some() {
+            return v;
+        }
+    }
+    if let Some(classes) = node.attribute("class") {
+        let v = classes
+            .split_whitespace()
+            .find_map(|cls| css_rules.get(cls)?.get(name).copied());
+        if v.is_some() {
+            return v;
+        }
+    }
+    node.attribute(name).map(|v| v.trim())
+}
+
+/// Barebones CSS class rules parser.
+///
+/// Returns a map from class name to property + value pairs. Only simple, flat class selectors
+/// (`.classname { prop: val; }`) are handled.
+pub fn parse_css<'a>(doc: &'a Document) -> HashMap<&'a str, HashMap<&'a str, &'a str>> {
+    let mut rules: HashMap<&str, HashMap<&str, &str>> = HashMap::new();
+    for node in doc.descendants() {
+        if node.tag_name().name() != "style" {
+            continue;
+        }
+        let Some(css) = node.text() else { continue };
+        for block in css.split('}') {
+            let Some((selector, declarations)) = block.split_once('{') else {
+                continue;
+            };
+            let props = declarations
+                .split(';')
+                .filter_map(|decl| {
+                    let (k, v) = decl.split_once(':')?;
+                    let k = k.trim();
+                    let v = v.trim();
+                    (!k.is_empty() && !v.is_empty()).then_some((k, v))
+                })
+                .collect::<HashMap<_, _>>();
+            if props.is_empty() {
+                continue;
+            }
+            for subselector in selector.split(',') {
+                let Some(class) = subselector.trim().strip_prefix('.') else {
+                    continue;
+                };
+                // Strip pseudo-classes and other complexity.
+                let class = class
+                    .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
+                    .next()
+                    .unwrap_or("")
+                    .trim();
+                if !class.is_empty() {
+                    rules.entry(class).or_default().extend(props.iter());
+                }
+            }
+        }
+    }
+    rules
+}
+
+/// Used to skip over SVG elements that are explicitly marked as do not render
+fn should_render_node(node: Node, render_symbol: bool) -> bool {
+    node.is_element()
+        && !node
+            .attribute("style")
+            .is_some_and(|style| style.split(';').any(|declaration| {
+                let mut parts = declaration.splitn(2, ':').map(str::trim);
+                (parts.next(), parts.next()) == (Some("display"), Some("none"))
+        }))
+        // - Defs are not directly rendered
+        // - Markers are not directly rendered
+        && !matches!(node.tag_name().name(), DEFS_TAG_NAME | MARKER_TAG_NAME)
+        // - Symbols are not directly rendered, unless referenced by a use
+        && (render_symbol || !matches!(node.tag_name().name(), SYMBOL_TAG_NAME))
+}
+
+/// Resolve `href` or `xlink:href` on a `<use>` element to a document node.
+/// Only fragment references (`#id`) within the same document are supported.
+fn resolve_use_href<'a, 'input: 'a>(
+    doc: &'a Document<'input>,
+    node: Node<'a, 'input>,
+) -> Option<Node<'a, 'input>> {
+    let href = node
+        .attribute("href")
+        .or_else(|| node.attribute(("http://www.w3.org/1999/xlink", "href")))?;
+    let id = href.strip_prefix('#')?;
+    doc.root()
+        .descendants()
+        .find(|n| n.attribute("id") == Some(id))
+}
+
+pub fn depth_first_visit(doc: &Document, visitor: &mut impl XmlVisitor) {
+    fn visit_node<V: XmlVisitor>(doc: &Document, node: Node, visitor: &mut V, render_symbol: bool) {
+        if !should_render_node(node, render_symbol) {
+            return;
+        }
+        visitor.visit_enter(node);
+        if node.tag_name().name() == USE_TAG_NAME
+            && let Some(referenced) = resolve_use_href(doc, node)
+        {
+            visit_node(doc, referenced, visitor, true);
+        } else {
+            node.children()
+                .for_each(|child| visit_node(doc, child, visitor, false));
+        }
+        visitor.visit_exit(node);
+    }
+
+    doc.root()
+        .children()
+        .for_each(|child| visit_node(doc, child, visitor, false));
+}
+
+impl<'a, 'input, T: Turtle> XmlVisitor for ConversionVisitor<'a, 'input, T> {
+    fn visit_enter(&mut self, node: Node) {
+        use PathSegment::*;
+
+        let mut view_box_opt = None;
+        let mut viewport_pos_opt = [None, None];
+        let mut viewport_size_opt = [1., 1.];
+
+        if node.tag_name().name() == CLIP_PATH_TAG_NAME {
+            warn!("Clip paths are not supported: {:?}", node);
+        }
+
+        let mut flattened_transform = if let Some(transform) = node.attribute("transform") {
+            // https://stackoverflow.com/questions/18582935/the-applying-order-of-svg-transforms
+            TransformListParser::from(transform)
+                .map(|token| token.expect("could not parse a transform in a list of transforms"))
+                .map(svg_transform_into_euclid_transform)
+                .fold(Transform2D::identity(), |acc, t| t.then(&acc))
+        } else {
+            Transform2D::identity()
+        };
+
+        // https://www.w3.org/TR/css-transforms-1/#transform-origin-property
+        if let Some(to_str) = node.attribute("transform-origin") {
+            let mut parser = LengthListParser::from(to_str);
+            let ox = parser
+                .next()
+                .and_then(|r| r.ok())
+                .map(|l| self.length_to_user_units(l, DimensionHint::Horizontal))
+                .unwrap_or(0.);
+            let oy = parser
+                .next()
+                .and_then(|r| r.ok())
+                .map(|l| self.length_to_user_units(l, DimensionHint::Vertical))
+                .unwrap_or(0.);
+            if ox != 0. || oy != 0. {
+                // https://www.w3.org/TR/css-transforms-1/#transformation-matrix-computation
+                // Steps 2 & 4
+                flattened_transform = Transform2D::translation(-ox, -oy)
+                    .then(&flattened_transform)
+                    .then(&Transform2D::translation(ox, oy));
+            }
+        }
+
+        // https://www.w3.org/TR/SVG/coords.html#EstablishingANewSVGViewport
+        if node.has_tag_name(SVG_TAG_NAME) {
+            let view_box = node
+                .attribute("viewBox")
+                .map(ViewBox::from_str)
+                .transpose()
+                .expect("could not parse viewBox")
+                .filter(|view_box| {
+                    if view_box.w <= 0. || view_box.h <= 0. {
+                        warn!("Invalid viewBox: {view_box:?}");
+                        false
+                    } else {
+                        true
+                    }
+                });
+            let preserve_aspect_ratio = node.attribute("preserveAspectRatio").map(|attr| {
+                AspectRatio::from_str(attr).expect("could not parse preserveAspectRatio")
+            });
+            let mut viewport_size =
+                ["width", "height"].map(|attr| self.length_attr_to_user_units(&node, attr));
+
+            let dimensions_override: [_; 2] = self
+                .options
+                .dimensions
+                .map(|l| l.map(|l| self.length_to_user_units(l, DimensionHint::Horizontal)));
+            for (original_dim, override_dim) in viewport_size.iter_mut().zip(dimensions_override) {
+                *original_dim = override_dim.or(*original_dim);
+            }
+
+            // https://www.w3.org/TR/SVG/coords.html#SizingSVGInCSS
+            // aka _natural_ aspect ratio
+            let intrinsic_aspect_ratio = match (view_box, viewport_size) {
+                (None, [Some(ref width), Some(ref height)]) => Some(*width / *height),
+                (Some(ref view_box), _) => Some(view_box.w / view_box.h),
+                (None, [None, None] | [None, Some(_)] | [Some(_), None]) => None,
+            };
+
+            // https://www.w3.org/TR/css-images-3/#default-sizing
+            let viewport_size = match (viewport_size, intrinsic_aspect_ratio, view_box) {
+                ([Some(w), Some(h)], _, _) => [w, h],
+                ([Some(w), None], Some(ratio), _) => [w, w / ratio],
+                ([None, Some(h)], Some(ratio), _) => [h * ratio, h],
+                ([None, None], _, Some(view_box)) => {
+                    // Fallback: if there is no width or height, assume the coordinate system is just pixels on the viewport
+                    [view_box.w, view_box.h]
+                }
+                ([Some(d), None] | [None, Some(d)], None, None) => [d, d],
+                ([None, None], _, None) => {
+                    // We have no info at all, nothing can be done
+                    [1., 1.]
+                }
+                ([None, Some(_)] | [Some(_), None], None, Some(_)) => {
+                    unreachable!("intrinsic ratio necessarily exists")
+                }
+            };
+
+            let viewport_pos = ["x", "y"].map(|attr| self.length_attr_to_user_units(&node, attr));
+
+            view_box_opt = view_box;
+            viewport_pos_opt = viewport_pos;
+            viewport_size_opt = viewport_size;
+
+            self.viewport_dim_stack
+                .push(match (view_box.as_ref(), &viewport_size) {
+                    (Some(ViewBox { w, h, .. }), _) => [*w, *h],
+                    (None, [w, h]) => [*w, *h],
+                });
+
+            if let Some(view_box) = view_box {
+                let viewport_transform = get_viewport_transform(
+                    view_box,
+                    preserve_aspect_ratio,
+                    viewport_size,
+                    viewport_pos,
+                );
+                flattened_transform = flattened_transform.then(&viewport_transform);
+            }
+            if self.coordinate_system == CoordinateSystem::YUp {
+                // Part 2 of converting from SVG (Y-down) to output (Y-up) coordinates:
+                // shift the origin from the top-left to the bottom-left of the viewport.
+                flattened_transform = flattened_transform.then(&Transform2D::translation(
+                    0.,
+                    -(viewport_size[1] + viewport_pos[1].unwrap_or(0.)),
+                ));
+            }
+        } else if node.has_tag_name(USE_TAG_NAME) {
+            // Per SVG spec, <use> x/y translate is appended to the element's transform
+            // https://www.w3.org/TR/SVG2/struct.html#UseLayout
+            let x = self.length_attr_to_user_units(&node, "x").unwrap_or(0.);
+            let y = self.length_attr_to_user_units(&node, "y").unwrap_or(0.);
+            flattened_transform = flattened_transform.then(&Transform2D::translation(x, y));
+        } else if node.has_tag_name(SYMBOL_TAG_NAME) {
+            let view_box = node
+                .attribute("viewBox")
+                .map(ViewBox::from_str)
+                .transpose()
+                .expect("could not parse viewBox on symbol")
+                .filter(|view_box| {
+                    if view_box.w <= 0. || view_box.h <= 0. {
+                        warn!("Invalid viewBox: {view_box:?}");
+                        false
+                    } else {
+                        true
+                    }
+                });
+            let preserve_aspect_ratio = node.attribute("preserveAspectRatio").map(|attr| {
+                AspectRatio::from_str(attr).expect("could not parse preserveAspectRatio")
+            });
+            // Viewport size: symbol's own width/height, or fallback to viewBox dims, or parent viewport
+            let viewport_size = match (
+                self.length_attr_to_user_units(&node, "width"),
+                self.length_attr_to_user_units(&node, "height"),
+                &view_box,
+            ) {
+                (Some(w), Some(h), _) => [w, h],
+                (_, _, Some(vb)) => [vb.w, vb.h],
+                _ => *self.viewport_dim_stack.last().unwrap_or(&[1., 1.]),
+            };
+            self.viewport_dim_stack.push(viewport_size);
+            if let Some(view_box) = view_box {
+                let viewport_transform = get_viewport_transform(
+                    view_box,
+                    preserve_aspect_ratio,
+                    viewport_size,
+                    [None, None],
+                );
+                flattened_transform = flattened_transform.then(&viewport_transform);
+                // Does not need Y-axis translation unlike <svg>, already in g-code coords space.
+            }
+            view_box_opt = view_box;
+            viewport_pos_opt = [None, None];
+            viewport_size_opt = viewport_size;
+        } else if node.has_attribute("viewBox") {
+            warn!("View box is not supported on a {}", node.tag_name().name());
+        }
+
+        self.terrarium.push_transform(flattened_transform);
+        self.name_stack
+            .push(node_name(&node, &self.config.extra_attribute_name));
+
+        if node.has_tag_name(SVG_TAG_NAME) || node.has_tag_name(SYMBOL_TAG_NAME) {
+            let viewport_box = if let Some(vb) = view_box_opt {
+                Box2D::new(Point::new(vb.x, vb.y), Point::new(vb.x + vb.w, vb.y + vb.h))
+            } else {
+                let px = viewport_pos_opt[0].unwrap_or(0.);
+                let py = viewport_pos_opt[1].unwrap_or(0.);
+                Box2D::new(
+                    Point::new(px, py),
+                    Point::new(px + viewport_size_opt[0], py + viewport_size_opt[1]),
+                )
+            };
+
+            self.terrarium.push_viewport_bounds(viewport_box);
+        }
+
+        if !self.should_draw_node(node) {
+            return;
+        }
+
+        let has_fill_attr = calculate_presentation_attr(node, "fill", &self.css_rules)
+            .map(|v| v != "none")
+            .unwrap_or(true);
+        let fill_rule = calculate_presentation_attr(node, "fill-rule", &self.css_rules)
+            .map(|v| {
+                if v == "evenodd" {
+                    FillRule::EvenOdd
+                } else {
+                    FillRule::NonZero
+                }
+            })
+            .unwrap_or_default();
+
+        // TODO: changing the default here to false would be breaking, but is technically correct from an SVG perspective.
+        let has_stroke_attr = calculate_presentation_attr(node, "stroke", &self.css_rules)
+            .map(|v| v != "none")
+            .unwrap_or(true);
+
+        match node.tag_name().name() {
+            PATH_TAG_NAME => {
+                let Some(d) = node.attribute("d") else {
+                    warn!("There is a path node containing no actual path: {node:?}");
+                    return;
+                };
+                let segments = PathParser::from(d)
+                    .map(|segment| segment.expect("could not parse path segment"));
+                let needs_fill = has_fill_attr;
+                if needs_fill || has_stroke_attr {
+                    self.comment();
+                    if needs_fill {
+                        self.terrarium.apply_polygon(segments.clone(), fill_rule);
+                    }
+                    if has_stroke_attr {
+                        self.terrarium.apply_path(segments);
+                    }
+                }
+            }
+            name @ (POLYLINE_TAG_NAME | POLYGON_TAG_NAME) => {
+                let Some(points) = node.attribute("points") else {
+                    warn!("There is a {name} node containing no actual path: {node:?}");
+                    return;
+                };
+                let is_polygon = name == POLYGON_TAG_NAME;
+                let mut pp = PointsParser::from(points).peekable();
+                let segments = pp
+                    .peek()
+                    .copied()
+                    .map(|(x, y)| MoveTo { abs: true, x, y })
+                    .into_iter()
+                    .chain(pp.map(|(x, y)| LineTo { abs: true, x, y }))
+                    .chain(is_polygon.then_some(ClosePath { abs: true }));
+
+                let needs_fill = has_fill_attr && is_polygon;
+                if needs_fill || has_stroke_attr {
+                    self.comment();
+                    if needs_fill {
+                        self.terrarium.apply_polygon(segments.clone(), fill_rule);
+                    }
+                    if has_stroke_attr {
+                        self.terrarium.apply_path(segments);
+                    }
+                }
+            }
+            RECT_TAG_NAME => {
+                let x = self.length_attr_to_user_units(&node, "x").unwrap_or(0.);
+                let y = self.length_attr_to_user_units(&node, "y").unwrap_or(0.);
+                let width = self.length_attr_to_user_units(&node, "width");
+                let height = self.length_attr_to_user_units(&node, "height");
+                let rx = self.length_attr_to_user_units(&node, "rx").unwrap_or(0.);
+                let ry = self.length_attr_to_user_units(&node, "ry").unwrap_or(0.);
+                let has_radius = rx > 0. && ry > 0.;
+
+                let (Some(width), Some(height)) = (width, height) else {
+                    warn!("Invalid rectangle node: {node:?}");
+                    return;
+                };
+                let segments = [
+                    MoveTo {
+                        abs: true,
+                        x: x + rx,
+                        y,
+                    },
+                    HorizontalLineTo {
+                        abs: true,
+                        x: x + width - rx,
+                    },
+                    EllipticalArc {
+                        abs: true,
+                        rx,
+                        ry,
+                        x_axis_rotation: 0.,
+                        large_arc: false,
+                        sweep: true,
+                        x: x + width,
+                        y: y + ry,
+                    },
+                    VerticalLineTo {
+                        abs: true,
+                        y: y + height - ry,
+                    },
+                    EllipticalArc {
+                        abs: true,
+                        rx,
+                        ry,
+                        x_axis_rotation: 0.,
+                        large_arc: false,
+                        sweep: true,
+                        x: x + width - rx,
+                        y: y + height,
+                    },
+                    HorizontalLineTo {
+                        abs: true,
+                        x: x + rx,
+                    },
+                    EllipticalArc {
+                        abs: true,
+                        rx,
+                        ry,
+                        x_axis_rotation: 0.,
+                        large_arc: false,
+                        sweep: true,
+                        x,
+                        y: y + height - ry,
+                    },
+                    VerticalLineTo {
+                        abs: true,
+                        y: y + ry,
+                    },
+                    EllipticalArc {
+                        abs: true,
+                        rx,
+                        ry,
+                        x_axis_rotation: 0.,
+                        large_arc: false,
+                        sweep: true,
+                        x: x + rx,
+                        y,
+                    },
+                    ClosePath { abs: true },
+                ]
+                .into_iter()
+                .filter(|p| has_radius || !matches!(p, EllipticalArc { .. }));
+
+                if has_fill_attr || has_stroke_attr {
+                    self.comment();
+                    if has_fill_attr {
+                        self.terrarium.apply_polygon(segments.clone(), fill_rule);
+                    }
+                    if has_stroke_attr {
+                        self.terrarium.apply_path(segments);
+                    }
+                }
+            }
+            CIRCLE_TAG_NAME | ELLIPSE_TAG_NAME => {
+                let cx = self.length_attr_to_user_units(&node, "cx").unwrap_or(0.);
+                let cy = self.length_attr_to_user_units(&node, "cy").unwrap_or(0.);
+                let r = self.length_attr_to_user_units(&node, "r").unwrap_or(0.);
+                let rx = self.length_attr_to_user_units(&node, "rx").unwrap_or(r);
+                let ry = self.length_attr_to_user_units(&node, "ry").unwrap_or(r);
+                if rx <= 0. || ry <= 0. {
+                    warn!("Invalid {} node: {node:?}", node.tag_name().name());
+                    return;
+                }
+                let segments = [
+                    MoveTo {
+                        abs: true,
+                        x: cx + rx,
+                        y: cy,
+                    },
+                    EllipticalArc {
+                        abs: true,
+                        rx,
+                        ry,
+                        x_axis_rotation: 0.,
+                        large_arc: false,
+                        sweep: true,
+                        x: cx,
+                        y: cy + ry,
+                    },
+                    EllipticalArc {
+                        abs: true,
+                        rx,
+                        ry,
+                        x_axis_rotation: 0.,
+                        large_arc: false,
+                        sweep: true,
+                        x: cx - rx,
+                        y: cy,
+                    },
+                    EllipticalArc {
+                        abs: true,
+                        rx,
+                        ry,
+                        x_axis_rotation: 0.,
+                        large_arc: false,
+                        sweep: true,
+                        x: cx,
+                        y: cy - ry,
+                    },
+                    EllipticalArc {
+                        abs: true,
+                        rx,
+                        ry,
+                        x_axis_rotation: 0.,
+                        large_arc: false,
+                        sweep: true,
+                        x: cx + rx,
+                        y: cy,
+                    },
+                    ClosePath { abs: true },
+                ];
+                if has_fill_attr || has_stroke_attr {
+                    self.comment();
+                    if has_fill_attr {
+                        self.terrarium.apply_polygon(segments, fill_rule);
+                    }
+                    if has_stroke_attr {
+                        self.terrarium.apply_path(segments);
+                    }
+                }
+            }
+            LINE_TAG_NAME => {
+                let (Some(x1), Some(y1), Some(x2), Some(y2)) = (
+                    self.length_attr_to_user_units(&node, "x1"),
+                    self.length_attr_to_user_units(&node, "y1"),
+                    self.length_attr_to_user_units(&node, "x2"),
+                    self.length_attr_to_user_units(&node, "y2"),
+                ) else {
+                    warn!("Invalid line node: {node:?}");
+                    return;
+                };
+                if has_stroke_attr {
+                    self.comment();
+                    self.terrarium.apply_path([
+                        MoveTo {
+                            abs: true,
+                            x: x1,
+                            y: y1,
+                        },
+                        LineTo {
+                            abs: true,
+                            x: x2,
+                            y: y2,
+                        },
+                    ]);
+                }
+            }
+            #[cfg(feature = "image")]
+            "image" => {
+                use base64::{Engine, engine::general_purpose::STANDARD};
+
+                let Some(href) = node
+                    .attribute("href")
+                    .or_else(|| node.attribute(("http://www.w3.org/1999/xlink", "href")))
+                else {
+                    warn!("image element has no href: {node:?}");
+                    return;
+                };
+                let Some(b64) = href
+                    .strip_prefix("data:image/png;base64,")
+                    .or_else(|| href.strip_prefix("data:image/jpeg;base64,"))
+                else {
+                    warn!("Unsupported image href {href}");
+                    return;
+                };
+
+                let b64_no_whitespace: String =
+                    b64.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+                let bytes = match STANDARD.decode(&b64_no_whitespace) {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        warn!("image base64 decode failed: {err}");
+                        return;
+                    }
+                };
+                let image = match image::load_from_memory(&bytes) {
+                    Ok(img) => img,
+                    Err(e) => {
+                        warn!("image decode failed: {e}");
+                        return;
+                    }
+                };
+
+                let x = self.length_attr_to_user_units(&node, "x").unwrap_or(0.);
+                let y = self.length_attr_to_user_units(&node, "y").unwrap_or(0.);
+                let width = self.length_attr_to_user_units(&node, "width").unwrap_or(0.);
+                let height = self
+                    .length_attr_to_user_units(&node, "height")
+                    .unwrap_or(0.);
+
+                let preserve_aspect_ratio = node
+                    .attribute("preserveAspectRatio")
+                    .map(|attr| {
+                        AspectRatio::from_str(attr).expect("could not parse preserveAspectRatio")
+                    })
+                    .unwrap_or(svgtypes::AspectRatio {
+                        defer: false,
+                        align: svgtypes::Align::XMidYMid,
+                        slice: false,
+                    });
+
+                let view_box = svgtypes::ViewBox {
+                    x: 0.,
+                    y: 0.,
+                    w: image.width() as f64,
+                    h: image.height() as f64,
+                };
+                let image_to_user = get_viewport_transform(
+                    view_box,
+                    Some(preserve_aspect_ratio),
+                    [width, height],
+                    [Some(x), Some(y)],
+                );
+
+                self.comment();
+                self.terrarium
+                    .image(image, image_to_user, preserve_aspect_ratio);
+            }
+            // No-op tags
+            SVG_TAG_NAME | GROUP_TAG_NAME | USE_TAG_NAME | SYMBOL_TAG_NAME => {}
+            other => {
+                debug!("Unhandled node: {other}");
+            }
+        }
+    }
+
+    fn visit_exit(&mut self, node: Node) {
+        self.terrarium.pop_transform();
+        self.name_stack.pop();
+        if matches!(node.tag_name().name(), SVG_TAG_NAME | SYMBOL_TAG_NAME) {
+            self.viewport_dim_stack.pop();
+            self.terrarium.pop_bounds();
+        }
+    }
+}

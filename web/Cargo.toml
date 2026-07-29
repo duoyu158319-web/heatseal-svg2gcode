@@ -1,0 +1,34 @@
+[package]
+name = "svg2gcode-web"
+version = "0.0.18"
+description = "Convert SVG toolpaths into heat-seal G-code in the browser"
+homepage = "https://duoyu158319-web.github.io/heatseal-svg2gcode/"
+authors.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
+wasm-bindgen = "0.2"
+svg2gcode = { path = "../g_code", version = "0.4.0", features = ["serde"] }
+svg2star = { path = "../star", version = "0.4.0", features = ["serde"] }
+roxmltree.workspace = true
+g-code.workspace = true
+codespan-reporting.workspace = true
+serde = { workspace = true, features = ["derive", "std"] }
+paste.workspace = true
+log.workspace = true
+svgtypes.workspace = true
+serde_json.workspace = true
+thiserror = "2"
+
+yew = { version = "0.23", features = ["csr"] }
+yewdux = "0.13"
+web-sys = { version = "0.3", features = ["Blob", "BlobPropertyBag", "Url", "Window"] }
+wasm-logger = "0.2"
+gloo-file = { version = "0.4", features = ["futures"] }
+gloo-timers = "0.4"
+base64 = "0.22"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"

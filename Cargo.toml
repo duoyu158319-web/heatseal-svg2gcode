@@ -1,0 +1,22 @@
+[workspace]
+members = ["g_code", "cli", "web", "star"]
+default-members = ["cli"]
+resolver = "2"
+
+[workspace.package]
+authors = ["Sameer Puri <crates@purisa.me>"]
+edition = "2024"
+repository = "https://github.com/duoyu158319-web/heatseal-svg2gcode"
+license = "MIT"
+
+[workspace.dependencies]
+codespan-reporting = "0.13"
+g-code = "0.6.0"
+log = "0"
+lyon_geom = "=1.0.19"
+paste = "1"
+roxmltree = "0.21"
+serde = { version = "1", default-features = false }
+serde_json = "1"
+svgtypes = "0.16"
+uom = "0.38"

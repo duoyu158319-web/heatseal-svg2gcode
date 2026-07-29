@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+./*.gcode
+pkg/
+dist
+lib/approx_circle.svg
+**/out
+.tools/
+web/style/spectre/*
+!web/style/spectre/LICENSE
+!web/style/spectre/src/
+!web/style/spectre/src/**
