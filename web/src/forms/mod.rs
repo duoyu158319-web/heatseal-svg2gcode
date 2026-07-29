@@ -301,10 +301,10 @@ pub fn import_export_modal() -> Html {
                 &gloo_file::File::from(file),
                 move |res| {
                     let res = res
-                        .map_err(|err| format!("Error reading {}: {}", &filename, err))
+                        .map_err(|err| format!("Error reading {}: {}", filename, err))
                         .and_then(|bytes| {
                             WebSettings::from_json_slice(&bytes)
-                                .map_err(|err| format!("Error parsing {}: {}", &filename, err))
+                                .map_err(|err| format!("Error parsing {}: {}", filename, err))
                         });
 
                     match res {
@@ -463,7 +463,7 @@ pub fn svg_form() -> Html {
                                 )
                                 .err()
                                 {
-                                    Err(format!("Error parsing {}: {}", &filename, err))
+                                    Err(format!("Error parsing {}: {}", filename, err))
                                 } else {
                                     Ok(Svg {
                                         content: text,
@@ -551,7 +551,7 @@ pub fn svg_form() -> Html {
                         {
                             url_input_parsed.set(Some(Err(format!(
                                 "Error parsing {}: {}",
-                                &response_url, err
+                                response_url, err
                             ))));
                         } else {
                             app.reduce_mut(|app| {
@@ -566,7 +566,7 @@ pub fn svg_form() -> Html {
                     Err(err) => {
                         url_input_parsed.set(Some(Err(format!(
                             "Error fetching {}: {:?}",
-                            &request_url,
+                            request_url,
                             err.dyn_into::<TypeError>().unwrap().message()
                         ))));
                     }
