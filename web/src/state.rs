@@ -1,33 +1,60 @@
 use std::{convert::TryInto, num::ParseFloatError};
 
 use serde::{Deserialize, Serialize};
-use svg2gcode::config::{
-    ConversionConfig, MachineConfig, PostprocessConfig, Settings, SupportedFunctionality, Version,
-};
+use svg2gcode::config::{ConversionConfig, MachineConfig, PostprocessConfig, Settings, Version};
 use svgtypes::Length;
 use thiserror::Error;
 use yewdux::store::Store;
+
+pub const DEFAULT_OUTER_FRAME_SIZE_MM: f64 = 150.;
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MachineModel {
+    #[default]
+    A1,
+    A2L,
+}
+
+impl MachineModel {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::A1 => "A1",
+            Self::A2L => "A2L",
+        }
+    }
+
+    pub const fn width_mm(self) -> f64 {
+        match self {
+            Self::A1 => 256.,
+            Self::A2L => 330.,
+        }
+    }
+
+    pub const fn height_mm(self) -> f64 {
+        match self {
+            Self::A1 => 256.,
+            Self::A2L => 320.,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Store)]
 #[store]
 pub struct FormState {
     pub tolerance: Result<f64, ParseFloatError>,
     pub feedrate: Result<f64, ParseFloatError>,
-    pub origin: [Option<Result<f64, ParseFloatError>>; 2],
-    pub circular_interpolation: bool,
-    pub optimize_path_order: bool,
     pub dpi: Result<f64, ParseFloatError>,
-    pub tool_on_sequence: Option<Result<String, String>>,
-    pub tool_off_sequence: Option<Result<String, String>>,
-    pub begin_sequence: Option<Result<String, String>>,
-    pub end_sequence: Option<Result<String, String>>,
-    pub checksums: bool,
-    pub line_numbers: bool,
-    pub newline_before_comment: bool,
-    pub starting_point: [Option<Result<f64, ParseFloatError>>; 2],
     pub dwell_seconds: Result<f64, String>,
     pub temperature: Result<f64, String>,
     pub working_height: Result<f64, String>,
+    pub auto_center_svg: bool,
+    pub machine_model: MachineModel,
+    pub outer_frame_enabled: bool,
+    pub outer_frame_width: Result<f64, String>,
+    pub outer_frame_height: Result<f64, String>,
+    pub outer_frame_temperature: Result<f64, String>,
+    pub outer_frame_working_height: Result<f64, String>,
+    pub outer_profile_sync_revision: u32,
 }
 
 impl Default for FormState {
@@ -41,8 +68,6 @@ impl Default for FormState {
 pub enum FormStateConversionError {
     #[error(transparent)]
     Float(#[from] ParseFloatError),
-    #[error("could not parse gcode: {0}")]
-    GCode(String),
 }
 
 impl TryInto<Settings> for &FormState {
@@ -53,51 +78,17 @@ impl TryInto<Settings> for &FormState {
             conversion: svg2gcode::config::GCodeConfig {
                 inner: ConversionConfig {
                     dpi: self.dpi.clone()?,
-                    origin: [
-                        self.origin[0].clone().transpose()?,
-                        self.origin[1].clone().transpose()?,
-                    ],
+                    origin: [Some(0.), Some(0.)],
                     extra_attribute_name: None,
-                    optimize_path_order: self.optimize_path_order,
+                    optimize_path_order: false,
                     selector_filter: None,
-                    starting_point: [
-                        self.starting_point[0].clone().transpose()?,
-                        self.starting_point[1].clone().transpose()?,
-                    ],
+                    starting_point: [Some(0.), Some(0.)],
                 },
                 tolerance: self.tolerance.clone()?,
                 feedrate: self.feedrate.clone()?,
             },
-            machine: MachineConfig {
-                supported_functionality: SupportedFunctionality {
-                    circular_interpolation: self.circular_interpolation,
-                },
-                tool_on_sequence: self
-                    .tool_on_sequence
-                    .clone()
-                    .transpose()
-                    .map_err(FormStateConversionError::GCode)?,
-                tool_off_sequence: self
-                    .tool_off_sequence
-                    .clone()
-                    .transpose()
-                    .map_err(FormStateConversionError::GCode)?,
-                begin_sequence: self
-                    .begin_sequence
-                    .clone()
-                    .transpose()
-                    .map_err(FormStateConversionError::GCode)?,
-                end_sequence: self
-                    .end_sequence
-                    .clone()
-                    .transpose()
-                    .map_err(FormStateConversionError::GCode)?,
-            },
-            postprocess: PostprocessConfig {
-                checksums: self.checksums,
-                line_numbers: self.line_numbers,
-                newline_before_comment: self.newline_before_comment,
-            },
+            machine: MachineConfig::default(),
+            postprocess: PostprocessConfig::default(),
             version: Version::latest(),
         })
     }
@@ -105,33 +96,22 @@ impl TryInto<Settings> for &FormState {
 
 impl From<&Settings> for FormState {
     fn from(settings: &Settings) -> Self {
+        let heat_seal = HeatSealSettings::default();
         Self {
             tolerance: Ok(settings.conversion.tolerance),
             feedrate: Ok(settings.conversion.feedrate),
-            circular_interpolation: settings
-                .machine
-                .supported_functionality
-                .circular_interpolation,
-            optimize_path_order: settings.conversion.inner.optimize_path_order,
-            origin: [
-                settings.conversion.inner.origin[0].map(Ok),
-                settings.conversion.inner.origin[1].map(Ok),
-            ],
             dpi: Ok(settings.conversion.inner.dpi),
-            tool_on_sequence: settings.machine.tool_on_sequence.clone().map(Ok),
-            tool_off_sequence: settings.machine.tool_off_sequence.clone().map(Ok),
-            begin_sequence: settings.machine.begin_sequence.clone().map(Ok),
-            end_sequence: settings.machine.end_sequence.clone().map(Ok),
-            checksums: settings.postprocess.checksums,
-            line_numbers: settings.postprocess.line_numbers,
-            newline_before_comment: settings.postprocess.newline_before_comment,
-            starting_point: [
-                settings.conversion.inner.starting_point[0].map(Ok),
-                settings.conversion.inner.starting_point[1].map(Ok),
-            ],
-            dwell_seconds: Ok(HeatSealSettings::default().dwell_seconds),
-            temperature: Ok(HeatSealSettings::default().temperature),
-            working_height: Ok(HeatSealSettings::default().working_height),
+            dwell_seconds: Ok(heat_seal.dwell_seconds),
+            temperature: Ok(heat_seal.temperature),
+            working_height: Ok(heat_seal.working_height),
+            auto_center_svg: heat_seal.auto_center_svg,
+            machine_model: heat_seal.machine_model,
+            outer_frame_enabled: heat_seal.outer_frame.enabled,
+            outer_frame_width: Ok(heat_seal.outer_frame.width_mm),
+            outer_frame_height: Ok(heat_seal.outer_frame.height_mm),
+            outer_frame_temperature: Ok(heat_seal.outer_frame.temperature),
+            outer_frame_working_height: Ok(heat_seal.outer_frame.working_height),
+            outer_profile_sync_revision: 0,
         }
     }
 }
@@ -142,6 +122,24 @@ impl FormState {
             dwell_seconds: HeatSealSettings::validate_dwell(heat_seal.dwell_seconds),
             temperature: HeatSealSettings::validate_temperature(heat_seal.temperature),
             working_height: HeatSealSettings::validate_height(heat_seal.working_height),
+            auto_center_svg: heat_seal.auto_center_svg,
+            machine_model: heat_seal.machine_model,
+            outer_frame_enabled: heat_seal.outer_frame.enabled,
+            outer_frame_width: OuterFrameSettings::validate_width(
+                heat_seal.outer_frame.width_mm,
+                heat_seal.machine_model,
+            ),
+            outer_frame_height: OuterFrameSettings::validate_height(
+                heat_seal.outer_frame.height_mm,
+                heat_seal.machine_model,
+            ),
+            outer_frame_temperature: HeatSealSettings::validate_temperature(
+                heat_seal.outer_frame.temperature,
+            ),
+            outer_frame_working_height: HeatSealSettings::validate_height(
+                heat_seal.outer_frame.working_height,
+            ),
+            outer_profile_sync_revision: 0,
             ..Self::from(settings)
         }
     }
@@ -151,15 +149,49 @@ impl FormState {
             dwell_seconds: *self.dwell_seconds.as_ref().unwrap(),
             temperature: *self.temperature.as_ref().unwrap(),
             working_height: *self.working_height.as_ref().unwrap(),
+            auto_center_svg: self.auto_center_svg,
+            machine_model: self.machine_model,
+            outer_frame: OuterFrameSettings {
+                enabled: self.outer_frame_enabled,
+                width_mm: *self.outer_frame_width.as_ref().unwrap(),
+                height_mm: *self.outer_frame_height.as_ref().unwrap(),
+                temperature: *self.outer_frame_temperature.as_ref().unwrap(),
+                working_height: *self.outer_frame_working_height.as_ref().unwrap(),
+            },
+        }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.tolerance.is_ok()
+            && self.feedrate.is_ok()
+            && self.dpi.is_ok()
+            && self.dwell_seconds.is_ok()
+            && self.temperature.is_ok()
+            && self.working_height.is_ok()
+            && self.outer_frame_width.is_ok()
+            && self.outer_frame_height.is_ok()
+            && self.outer_frame_temperature.is_ok()
+            && self.outer_frame_working_height.is_ok()
+    }
+
+    pub fn select_machine_model(&mut self, machine_model: MachineModel) {
+        if self.machine_model != machine_model {
+            self.machine_model = machine_model;
+            self.outer_frame_width = Ok(DEFAULT_OUTER_FRAME_SIZE_MM);
+            self.outer_frame_height = Ok(DEFAULT_OUTER_FRAME_SIZE_MM);
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct HeatSealSettings {
     pub dwell_seconds: f64,
     pub temperature: f64,
     pub working_height: f64,
+    pub auto_center_svg: bool,
+    pub machine_model: MachineModel,
+    pub outer_frame: OuterFrameSettings,
 }
 
 impl Default for HeatSealSettings {
@@ -168,7 +200,66 @@ impl Default for HeatSealSettings {
             dwell_seconds: 120.,
             temperature: 230.,
             working_height: 0.12,
+            auto_center_svg: false,
+            machine_model: MachineModel::A1,
+            outer_frame: OuterFrameSettings::default(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct OuterFrameSettings {
+    pub enabled: bool,
+    pub width_mm: f64,
+    pub height_mm: f64,
+    pub temperature: f64,
+    pub working_height: f64,
+}
+
+impl Default for OuterFrameSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            width_mm: DEFAULT_OUTER_FRAME_SIZE_MM,
+            height_mm: DEFAULT_OUTER_FRAME_SIZE_MM,
+            temperature: 230.,
+            working_height: 0.12,
+        }
+    }
+}
+
+impl OuterFrameSettings {
+    fn validate_dimension(
+        value: f64,
+        maximum: f64,
+        dimension: &'static str,
+        machine_model: MachineModel,
+    ) -> Result<f64, String> {
+        HeatSealSettings::validate_value(
+            value,
+            |value| value > 0. && value <= maximum,
+            format!(
+                "Outer-frame {dimension} must be greater than 0 and no more than {maximum} mm for {}",
+                machine_model.label()
+            ),
+        )
+    }
+
+    pub fn validate_width(value: f64, machine_model: MachineModel) -> Result<f64, String> {
+        Self::validate_dimension(value, machine_model.width_mm(), "width", machine_model)
+    }
+
+    pub fn validate_height(value: f64, machine_model: MachineModel) -> Result<f64, String> {
+        Self::validate_dimension(value, machine_model.height_mm(), "height", machine_model)
+    }
+
+    pub fn validate(&self, machine_model: MachineModel) -> Result<(), String> {
+        Self::validate_width(self.width_mm, machine_model)?;
+        Self::validate_height(self.height_mm, machine_model)?;
+        HeatSealSettings::validate_temperature(self.temperature)?;
+        HeatSealSettings::validate_height(self.working_height)?;
+        Ok(())
     }
 }
 
@@ -200,12 +291,12 @@ impl HeatSealSettings {
     fn validate_value(
         value: f64,
         valid: impl FnOnce(f64) -> bool,
-        requirement: &'static str,
+        requirement: impl Into<String>,
     ) -> Result<f64, String> {
         if value.is_finite() && valid(value) {
             Ok(value)
         } else {
-            Err(requirement.to_owned())
+            Err(requirement.into())
         }
     }
 
@@ -213,11 +304,29 @@ impl HeatSealSettings {
         Self::validate_dwell(self.dwell_seconds)?;
         Self::validate_temperature(self.temperature)?;
         Self::validate_height(self.working_height)?;
+        self.outer_frame.validate(self.machine_model)?;
         Ok(())
+    }
+
+    fn migrate_from_web_v1(&mut self) {
+        self.auto_center_svg = false;
+        self.outer_frame = OuterFrameSettings {
+            temperature: self.temperature,
+            working_height: self.working_height,
+            ..OuterFrameSettings::default()
+        };
+    }
+
+    fn migrate_from_web_v2(&mut self) {
+        self.machine_model = MachineModel::A1;
+        if self.outer_frame.validate(self.machine_model).is_err() {
+            self.outer_frame.width_mm = DEFAULT_OUTER_FRAME_SIZE_MM;
+            self.outer_frame.height_mm = DEFAULT_OUTER_FRAME_SIZE_MM;
+        }
     }
 }
 
-pub const WEB_SETTINGS_VERSION: u32 = 1;
+pub const WEB_SETTINGS_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WebSettings {
@@ -245,12 +354,47 @@ impl WebSettings {
         }
 
         serde_json::from_slice(bytes).map(|settings| match settings {
-            CompatibleSettings::Web(settings) => settings,
+            CompatibleSettings::Web(mut settings) => {
+                if settings.version < 2 {
+                    settings.heat_seal.migrate_from_web_v1();
+                }
+                if settings.version < 3 {
+                    settings.heat_seal.migrate_from_web_v2();
+                }
+                if settings.version < WEB_SETTINGS_VERSION {
+                    settings.version = WEB_SETTINGS_VERSION;
+                }
+                settings
+            }
             CompatibleSettings::Legacy(settings) => {
                 WebSettings::new(settings, HeatSealSettings::default())
             }
         })
     }
+}
+
+pub fn normalize_settings_for_web_heat_seal(settings: &mut Settings) {
+    let version = settings.version.clone();
+    let tolerance = settings.conversion.tolerance;
+    let feedrate = settings.conversion.feedrate;
+    let dpi = settings.conversion.inner.dpi;
+    *settings = Settings {
+        conversion: svg2gcode::config::GCodeConfig {
+            inner: ConversionConfig {
+                dpi,
+                origin: [Some(0.), Some(0.)],
+                extra_attribute_name: None,
+                optimize_path_order: false,
+                selector_filter: None,
+                starting_point: [Some(0.), Some(0.)],
+            },
+            tolerance,
+            feedrate,
+        },
+        machine: MachineConfig::default(),
+        postprocess: PostprocessConfig::default(),
+        version,
+    };
 }
 
 #[cfg(test)]
@@ -265,10 +409,41 @@ mod tests {
                 dwell_seconds: 45.,
                 temperature: 215.,
                 working_height: 0.8,
+                auto_center_svg: true,
+                machine_model: MachineModel::A2L,
+                outer_frame: OuterFrameSettings {
+                    enabled: true,
+                    width_mm: 150.,
+                    height_mm: 140.,
+                    temperature: 205.,
+                    working_height: 0.6,
+                },
             },
         );
         let json = serde_json::to_vec(&wrapper).unwrap();
         assert_eq!(WebSettings::from_json_slice(&json).unwrap(), wrapper);
+    }
+
+    #[test]
+    fn web_v1_import_inherits_svg_profile_for_disabled_outer_frame() {
+        let json = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "settings": Settings::default(),
+            "heat_seal": {
+                "dwell_seconds": 45,
+                "temperature": 215,
+                "working_height": 0.8
+            }
+        }))
+        .unwrap();
+        let imported = WebSettings::from_json_slice(&json).unwrap();
+        assert_eq!(imported.version, WEB_SETTINGS_VERSION);
+        assert!(!imported.heat_seal.auto_center_svg);
+        assert_eq!(imported.heat_seal.outer_frame.width_mm, 150.);
+        assert_eq!(imported.heat_seal.outer_frame.height_mm, 150.);
+        assert_eq!(imported.heat_seal.outer_frame.temperature, 215.);
+        assert_eq!(imported.heat_seal.outer_frame.working_height, 0.8);
+        assert!(!imported.heat_seal.outer_frame.enabled);
     }
 
     #[test]
@@ -278,6 +453,40 @@ mod tests {
         let imported = WebSettings::from_json_slice(&json).unwrap();
         assert_eq!(imported.settings, legacy);
         assert_eq!(imported.heat_seal, HeatSealSettings::default());
+    }
+
+    #[test]
+    fn web_v2_import_defaults_to_a1_and_resets_oversized_frame() {
+        let json = serde_json::to_vec(&serde_json::json!({
+            "version": 2,
+            "settings": Settings::default(),
+            "heat_seal": {
+                "dwell_seconds": 120,
+                "temperature": 230,
+                "working_height": 0.12,
+                "outer_frame": {
+                    "enabled": true,
+                    "width_mm": 300,
+                    "height_mm": 300,
+                    "temperature": 220,
+                    "working_height": 0.2
+                }
+            }
+        }))
+        .unwrap();
+        let imported = WebSettings::from_json_slice(&json).unwrap();
+        assert_eq!(imported.version, WEB_SETTINGS_VERSION);
+        assert_eq!(imported.heat_seal.machine_model, MachineModel::A1);
+        assert_eq!(
+            imported.heat_seal.outer_frame.width_mm,
+            DEFAULT_OUTER_FRAME_SIZE_MM
+        );
+        assert_eq!(
+            imported.heat_seal.outer_frame.height_mm,
+            DEFAULT_OUTER_FRAME_SIZE_MM
+        );
+        assert_eq!(imported.heat_seal.outer_frame.temperature, 220.);
+        assert_eq!(imported.heat_seal.outer_frame.working_height, 0.2);
     }
 }
 
@@ -336,7 +545,7 @@ impl Default for AppState {
     }
 }
 
-const APP_STATE_STORAGE_VERSION: u32 = 1;
+const APP_STATE_STORAGE_VERSION: u32 = 3;
 const LEGACY_DEFAULT_WORKING_HEIGHT: f64 = 1.2;
 
 impl AppState {
@@ -347,6 +556,15 @@ impl AppState {
             }
             self.storage_version = 1;
         }
+        if self.storage_version < 2 {
+            self.heat_seal.migrate_from_web_v1();
+            self.storage_version = 2;
+        }
+        if self.storage_version < 3 {
+            self.heat_seal.migrate_from_web_v2();
+            self.storage_version = 3;
+        }
+        normalize_settings_for_web_heat_seal(&mut self.settings);
     }
 }
 
@@ -357,20 +575,65 @@ mod app_state_tests {
     #[test]
     fn heat_seal_default_working_height_is_point_twelve_mm() {
         assert_eq!(HeatSealSettings::default().working_height, 0.12);
+        assert_eq!(HeatSealSettings::default().outer_frame.working_height, 0.12);
     }
 
     #[test]
-    fn migrates_the_legacy_default_height_but_preserves_custom_values() {
+    fn migrates_legacy_height_and_new_outer_frame_defaults() {
         let mut legacy_default = AppState::default();
         legacy_default.storage_version = 0;
         legacy_default.heat_seal.working_height = LEGACY_DEFAULT_WORKING_HEIGHT;
         legacy_default.migrate();
         assert_eq!(legacy_default.heat_seal.working_height, 0.12);
+        assert_eq!(legacy_default.heat_seal.outer_frame.working_height, 0.12);
+        assert!(!legacy_default.heat_seal.outer_frame.enabled);
 
         let mut custom = AppState::default();
-        custom.storage_version = 0;
+        custom.storage_version = 1;
+        custom.heat_seal.temperature = 212.;
         custom.heat_seal.working_height = 0.8;
         custom.migrate();
-        assert_eq!(custom.heat_seal.working_height, 0.8);
+        assert_eq!(custom.heat_seal.outer_frame.temperature, 212.);
+        assert_eq!(custom.heat_seal.outer_frame.working_height, 0.8);
+    }
+
+    #[test]
+    fn changing_machine_model_always_resets_both_frame_dimensions() {
+        let mut form = FormState::default();
+        form.outer_frame_temperature = Ok(242.);
+        form.outer_frame_working_height = Ok(0.2);
+        form.outer_frame_width = Ok(200.);
+        form.outer_frame_height = Ok(180.);
+        form.select_machine_model(MachineModel::A2L);
+        assert_eq!(form.machine_model, MachineModel::A2L);
+        assert_eq!(form.outer_frame_width, Ok(DEFAULT_OUTER_FRAME_SIZE_MM));
+        assert_eq!(form.outer_frame_height, Ok(DEFAULT_OUTER_FRAME_SIZE_MM));
+        assert_eq!(form.outer_frame_temperature, Ok(242.));
+        assert_eq!(form.outer_frame_working_height, Ok(0.2));
+
+        form.outer_frame_width = Ok(300.);
+        form.outer_frame_height = Ok(300.);
+        form.select_machine_model(MachineModel::A1);
+        assert_eq!(form.outer_frame_width, Ok(DEFAULT_OUTER_FRAME_SIZE_MM));
+        assert_eq!(form.outer_frame_height, Ok(DEFAULT_OUTER_FRAME_SIZE_MM));
+    }
+
+    #[test]
+    fn selecting_current_machine_model_does_not_reset_dimensions() {
+        let mut form = FormState::default();
+        form.outer_frame_width = Ok(200.);
+        form.outer_frame_height = Ok(180.);
+        form.select_machine_model(MachineModel::A1);
+        assert_eq!(form.outer_frame_width, Ok(200.));
+        assert_eq!(form.outer_frame_height, Ok(180.));
+    }
+
+    #[test]
+    fn machine_specific_dimension_validation_uses_correct_limits() {
+        assert!(OuterFrameSettings::validate_width(256., MachineModel::A1).is_ok());
+        assert!(OuterFrameSettings::validate_width(256.1, MachineModel::A1).is_err());
+        assert!(OuterFrameSettings::validate_width(330., MachineModel::A2L).is_ok());
+        assert!(OuterFrameSettings::validate_height(320., MachineModel::A2L).is_ok());
+        assert!(OuterFrameSettings::validate_height(320.1, MachineModel::A2L).is_err());
     }
 }

@@ -3,14 +3,10 @@
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
-use g_code::emit::FormatOptions;
 use getrandom as _; // activate wasm_js backend for wasm32-unknown-unknown
 use log::Level;
 use roxmltree::{Document, ParsingOptions};
-use svg2star::{
-    lower::{ConversionOptions, svg_to_turtle},
-    turtle::{CoordinateSystem, SvgPreviewTurtle},
-};
+use svg2star::{lower::ConversionOptions, turtle::elements::Stroke};
 use yew::prelude::*;
 
 mod forms;
@@ -21,21 +17,15 @@ mod ui;
 mod util;
 
 use forms::*;
-use heat_seal::{collect_effective_strokes, format_heat_seal_program, svg_to_heat_seal_program};
+use heat_seal::{
+    build_heat_seal_program, format_heat_seal_program, frame_fit_error, prepare_svg_strokes,
+    strokes_to_preview,
+};
 use marker_replace::{replace_marker_line, with_original_utf8_bom};
 use state::*;
 use ui::*;
 use util::*;
 use yewdux::{YewduxRoot, prelude::use_store, use_dispatch};
-
-fn format_options(settings: &svg2gcode::config::Settings) -> FormatOptions {
-    FormatOptions {
-        checksums: settings.postprocess.checksums,
-        line_numbers: settings.postprocess.line_numbers,
-        newline_before_comment: settings.postprocess.newline_before_comment,
-        ..Default::default()
-    }
-}
 
 fn replacement_output_path(filename: &str) -> PathBuf {
     let stem = Path::new(filename)
@@ -43,6 +33,67 @@ fn replacement_output_path(filename: &str) -> PathBuf {
         .and_then(|stem| stem.to_str())
         .unwrap_or("output");
     PathBuf::from(format!("{stem}_heatseal.gcode"))
+}
+
+fn prepared_strokes_for_svg(
+    svg: &Svg,
+    settings: &svg2gcode::config::Settings,
+    heat_seal: &HeatSealSettings,
+) -> Result<Vec<Stroke>, String> {
+    let document = Document::parse_with_options(
+        svg.content.as_str(),
+        ParsingOptions {
+            allow_dtd: true,
+            ..Default::default()
+        },
+    )
+    .map_err(|err| format!("Could not parse {}: {err}", svg.filename))?;
+    let strokes = prepare_svg_strokes(
+        &document,
+        &settings.conversion,
+        ConversionOptions {
+            dimensions: svg.dimensions,
+        },
+        heat_seal.auto_center_svg,
+    );
+    if strokes.is_empty() {
+        return Err(format!(
+            "No effective toolpath was found in {}.",
+            svg.filename
+        ));
+    }
+    if let Some(error) = frame_fit_error(&strokes, heat_seal) {
+        return Err(format!("{}：{error}", svg.filename));
+    }
+    Ok(strokes)
+}
+
+fn toolpath_preview(
+    svg: &Svg,
+    settings: &svg2gcode::config::Settings,
+    heat_seal: &HeatSealSettings,
+    include_outer_frame: bool,
+) -> String {
+    Document::parse_with_options(
+        svg.content.as_str(),
+        ParsingOptions {
+            allow_dtd: true,
+            ..Default::default()
+        },
+    )
+    .ok()
+    .map(|document| {
+        prepare_svg_strokes(
+            &document,
+            &settings.conversion,
+            ConversionOptions {
+                dimensions: svg.dimensions,
+            },
+            heat_seal.auto_center_svg,
+        )
+    })
+    .map(|strokes| strokes_to_preview(strokes, heat_seal, include_outer_frame))
+    .unwrap_or_default()
 }
 
 #[function_component(App)]
@@ -65,39 +116,15 @@ fn app() -> Html {
             if app.settings.try_upgrade().is_err() {
                 unreachable!("No breaking upgrades yet!")
             }
+            normalize_settings_for_web_heat_seal(&mut app.settings);
             let hydrated_form_state = FormState::from_app(&app.settings, &app.heat_seal);
             form_dispatch.reduce_mut(|state| *state = hydrated_form_state);
         });
         upgraded_settings_and_hydrated_form.set(true);
     }
 
-    let invalid_svg_names = app_store
-        .svgs
-        .iter()
-        .filter_map(|svg| {
-            let document = Document::parse_with_options(
-                svg.content.as_str(),
-                ParsingOptions {
-                    allow_dtd: true,
-                    ..Default::default()
-                },
-            )
-            .ok()?;
-            let strokes = collect_effective_strokes(
-                &document,
-                &app_store.settings.conversion,
-                ConversionOptions {
-                    dimensions: svg.dimensions,
-                },
-            );
-            strokes.is_empty().then(|| svg.filename.clone())
-        })
-        .collect::<Vec<_>>();
-    let no_valid_trajectory_error = (!invalid_svg_names.is_empty()).then(|| {
-        format!(
-            "No effective toolpath found in: {}. Remove or replace the file before downloading.",
-            invalid_svg_names.join(", ")
-        )
+    let merge_validation_error = app_store.svgs.iter().find_map(|svg| {
+        prepared_strokes_for_svg(svg, &app_store.settings, &app_store.heat_seal).err()
     });
     let marker_validation_error = app_store.gcode_template.as_ref().and_then(|template| {
         replace_marker_line(&template.content, "")
@@ -105,27 +132,11 @@ fn app() -> Html {
             .map(|err| err.to_string())
     });
     let replacement_trajectory_error = app_store.replacement_svg.as_ref().and_then(|svg| {
-        let document = Document::parse_with_options(
-            svg.content.as_str(),
-            ParsingOptions {
-                allow_dtd: true,
-                ..Default::default()
-            },
-        )
-        .ok()?;
-        collect_effective_strokes(
-            &document,
-            &app_store.settings.conversion,
-            ConversionOptions {
-                dimensions: svg.dimensions,
-            },
-        )
-        .is_empty()
-        .then(|| format!("No effective toolpath found in {}.", svg.filename))
+        prepared_strokes_for_svg(svg, &app_store.settings, &app_store.heat_seal).err()
     });
 
     let merge_generate_disabled =
-        *generating || app_store.svgs.is_empty() || no_valid_trajectory_error.is_some();
+        *generating || app_store.svgs.is_empty() || merge_validation_error.is_some();
     let replacement_generate_disabled = *generating
         || app_store.replacement_svg.is_none()
         || app_store.gcode_template.is_none()
@@ -139,44 +150,25 @@ fn app() -> Html {
         Callback::from(move |_| {
             generating_setter.set(true);
             generate_error.set(None);
-            let mut merged_program = Vec::new();
+            let mut merged_strokes = Vec::new();
 
             for svg in app_store.svgs.iter() {
-                let options = ConversionOptions {
-                    dimensions: svg.dimensions,
-                };
-
-                let document = Document::parse_with_options(
-                    svg.content.as_str(),
-                    ParsingOptions {
-                        allow_dtd: true,
-                        ..Default::default()
-                    },
-                )
-                .unwrap();
-
-                let mut program = svg_to_heat_seal_program(
-                    &document,
-                    &app_store.settings.conversion,
-                    options,
-                    &app_store.heat_seal,
-                    app_store.settings.machine.supported_functionality.clone(),
-                );
-
-                if program.is_empty() {
-                    generate_error.set(Some(format!(
-                        "No effective toolpath found in {}.",
-                        svg.filename
-                    )));
-                    generating_setter.set(false);
-                    return;
+                match prepared_strokes_for_svg(svg, &app_store.settings, &app_store.heat_seal) {
+                    Ok(mut strokes) => merged_strokes.append(&mut strokes),
+                    Err(error) => {
+                        generate_error.set(Some(error));
+                        generating_setter.set(false);
+                        return;
+                    }
                 }
-                merged_program.append(&mut program);
             }
 
-            let output =
-                format_heat_seal_program(&merged_program, format_options(&app_store.settings))
-                    .unwrap();
+            let program = build_heat_seal_program(
+                merged_strokes,
+                &app_store.settings.conversion,
+                &app_store.heat_seal,
+            );
+            let output = format_heat_seal_program(&program).unwrap();
             let filepath = if app_store.svgs.len() == 1 {
                 Path::new(app_store.svgs[0].filename.as_str()).with_extension("gcode")
             } else {
@@ -198,35 +190,21 @@ fn app() -> Html {
 
             let svg = app_store.replacement_svg.as_ref().unwrap();
             let template = app_store.gcode_template.as_ref().unwrap();
-            let document = Document::parse_with_options(
-                svg.content.as_str(),
-                ParsingOptions {
-                    allow_dtd: true,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-            let program = svg_to_heat_seal_program(
-                &document,
+            let strokes =
+                match prepared_strokes_for_svg(svg, &app_store.settings, &app_store.heat_seal) {
+                    Ok(strokes) => strokes,
+                    Err(error) => {
+                        generate_error.set(Some(error));
+                        generating_setter.set(false);
+                        return;
+                    }
+                };
+            let program = build_heat_seal_program(
+                strokes,
                 &app_store.settings.conversion,
-                ConversionOptions {
-                    dimensions: svg.dimensions,
-                },
                 &app_store.heat_seal,
-                app_store.settings.machine.supported_functionality.clone(),
             );
-
-            if program.is_empty() {
-                generate_error.set(Some(format!(
-                    "No effective toolpath found in {}.",
-                    svg.filename
-                )));
-                generating_setter.set(false);
-                return;
-            }
-
-            let replacement =
-                format_heat_seal_program(&program, format_options(&app_store.settings)).unwrap();
+            let replacement = format_heat_seal_program(&program).unwrap();
             match replace_marker_line(&template.content, &replacement) {
                 Ok(output) => {
                     let bytes = with_original_utf8_bom(&output, template.had_utf8_bom);
@@ -316,7 +294,7 @@ fn app() -> Html {
                 {
                     {
                         let mode_error = match app_store.workflow_mode {
-                            WorkflowMode::MergeSvg => no_valid_trajectory_error.as_ref(),
+                            WorkflowMode::MergeSvg => merge_validation_error.as_ref(),
                             WorkflowMode::ReplaceMarker => marker_validation_error.as_ref().or(replacement_trajectory_error.as_ref()),
                         };
                         if let Some(error) = mode_error.or(generate_error.as_ref()) {
@@ -330,16 +308,12 @@ fn app() -> Html {
                     {
                         for app_store.svgs.iter().enumerate().filter(|_| app_store.workflow_mode == WorkflowMode::MergeSvg).map(|(i, svg)| {
                             let svg_base64 = base64::engine::general_purpose::STANDARD_NO_PAD.encode(svg.content.as_bytes());
-                            let preview_svg = Document::parse_with_options(
-                                svg.content.as_str(),
-                                ParsingOptions { allow_dtd: true, ..Default::default() },
-                            )
-                            .ok()
-                            .map(|doc| {
-                                let options = ConversionOptions { dimensions: svg.dimensions };
-                                svg_to_turtle(&doc, &app_store.settings.conversion.inner, options, SvgPreviewTurtle::default(), CoordinateSystem::YUp).into_preview()
-                            })
-                            .unwrap_or_default();
+                            let preview_svg = toolpath_preview(
+                                svg,
+                                &app_store.settings,
+                                &app_store.heat_seal,
+                                i == 0,
+                            );
                             let preview_svg_base64 = base64::engine::general_purpose::STANDARD_NO_PAD.encode(preview_svg.as_bytes());
                             let open_preview = {
                                 let bytes = preview_svg.into_bytes();
@@ -387,16 +361,12 @@ fn app() -> Html {
                         if app_store.workflow_mode == WorkflowMode::ReplaceMarker {
                             app_store.replacement_svg.as_ref().map(|svg| {
                                 let svg_base64 = base64::engine::general_purpose::STANDARD_NO_PAD.encode(svg.content.as_bytes());
-                                let preview_svg = Document::parse_with_options(
-                                    svg.content.as_str(),
-                                    ParsingOptions { allow_dtd: true, ..Default::default() },
-                                )
-                                .ok()
-                                .map(|doc| {
-                                    let options = ConversionOptions { dimensions: svg.dimensions };
-                                    svg_to_turtle(&doc, &app_store.settings.conversion.inner, options, SvgPreviewTurtle::default(), CoordinateSystem::YUp).into_preview()
-                                })
-                                .unwrap_or_default();
+                                let preview_svg = toolpath_preview(
+                                    svg,
+                                    &app_store.settings,
+                                    &app_store.heat_seal,
+                                    true,
+                                );
                                 let preview_svg_base64 = base64::engine::general_purpose::STANDARD_NO_PAD.encode(preview_svg.as_bytes());
                                 let open_preview = {
                                     let bytes = preview_svg.into_bytes();

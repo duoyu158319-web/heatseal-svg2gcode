@@ -14,83 +14,40 @@ use yew::prelude::*;
 use yewdux::{functional::use_store, use_dispatch};
 
 use crate::{
-    state::{AppState, FormState, GCodeTemplate, Svg, WEB_SETTINGS_VERSION, WebSettings},
+    state::{
+        AppState, FormState, GCodeTemplate, Svg, WEB_SETTINGS_VERSION, WebSettings,
+        normalize_settings_for_web_heat_seal,
+    },
     ui::{
         Button, ButtonStyle, Checkbox, FileUpload, FormGroup, HyperlinkButton, Icon, IconName,
         Input, InputType, Modal,
     },
 };
 
-mod editors;
 mod inputs;
+mod workbench;
 
-use editors::*;
 use inputs::*;
+use workbench::MachineWorkbench;
 
 #[function_component(SettingsForm)]
 pub fn settings_form() -> Html {
     let app_dispatch = use_dispatch::<AppState>();
     let (form_state, form_dispatch) = use_store::<FormState>();
-
-    let disabled = form_state.tolerance.is_err()
-        || form_state.feedrate.is_err()
-        || form_state.dpi.is_err()
-        || form_state
-            .origin
-            .iter()
-            .all(|opt| opt.as_ref().is_some_and(|r| r.is_err()))
-        || form_state
-            .tool_on_sequence
-            .as_ref()
-            .map(Result::is_err)
-            .unwrap_or(false)
-        || form_state
-            .tool_off_sequence
-            .as_ref()
-            .map(Result::is_err)
-            .unwrap_or(false)
-        || form_state
-            .begin_sequence
-            .as_ref()
-            .map(Result::is_err)
-            .unwrap_or(false)
-        || form_state
-            .end_sequence
-            .as_ref()
-            .map(Result::is_err)
-            .unwrap_or(false)
-        || form_state.dwell_seconds.is_err()
-        || form_state.temperature.is_err()
-        || form_state.working_height.is_err();
+    let advanced_open = use_state(|| false);
+    let disabled = !form_state.is_valid();
 
     let close_ref = use_node_ref();
-
-    // MDN says on input should fire for checkboxes
-    // but historically hasn't been the case, on change is safer.
-    let on_circular_interpolation_change =
-        form_dispatch.reduce_mut_callback_with(|form, event: Event| {
-            form.circular_interpolation =
-                event.target_unchecked_into::<HtmlInputElement>().checked();
-        });
-
-    let on_optimize_path_order_change =
-        form_dispatch.reduce_mut_callback_with(|form, event: Event| {
-            form.optimize_path_order = event.target_unchecked_into::<HtmlInputElement>().checked();
-        });
-
-    let on_checksums_change = form_dispatch.reduce_mut_callback_with(|form, event: Event| {
-        form.checksums = event.target_unchecked_into::<HtmlInputElement>().checked();
+    let on_auto_center_change = form_dispatch.reduce_mut_callback_with(|form, event: Event| {
+        form.auto_center_svg = event.target_unchecked_into::<HtmlInputElement>().checked();
     });
-
-    let on_line_numbers_change = form_dispatch.reduce_mut_callback_with(|form, event: Event| {
-        form.line_numbers = event.target_unchecked_into::<HtmlInputElement>().checked();
+    let on_outer_frame_change = form_dispatch.reduce_mut_callback_with(|form, event: Event| {
+        form.outer_frame_enabled = event.target_unchecked_into::<HtmlInputElement>().checked();
     });
-
-    let on_newline_before_comment_change =
-        form_dispatch.reduce_mut_callback_with(|form, event: Event| {
-            form.newline_before_comment =
-                event.target_unchecked_into::<HtmlInputElement>().checked();
-        });
+    let advanced_toggle = {
+        let advanced_open = advanced_open.clone();
+        Callback::from(move |_| advanced_open.set(!*advanced_open))
+    };
 
     let save_onclick = {
         let close_ref = close_ref.clone();
@@ -114,116 +71,78 @@ pub fn settings_form() -> Html {
             header={
                 html!(
                     <>
-                        <h2>{ "Settings" }</h2>
-                        <p>{"Persisted using "}
-                            // Opening new tabs is usually bad.
-                            // But if we don't, the user is at risk of losing the settings they've entered so far.
-                            <a href="https://developer.mozilla.org/en-US/docs/Web/API/Window/localStorage" target="_blank">
-                                {"local storage"}
-                            </a>
-                            {"."}
-                            {" Reloading the page clears unsaved settings."}
-                        </p>
+                        <h2>{ "Heat-Seal Output Settings" }</h2>
+                        <p>{"Click Save to store these settings in this browser. Unsaved changes are lost when the page is reloaded."}</p>
                     </>
                 )
             }
             body={html!(
-                <div class="columns">
-                    <div class="column col-6 col-sm-12">
-                        <ToleranceInput/>
-                    </div>
-                    <div class="column col-6 col-sm-12">
-                        <FeedrateInput/>
-                    </div>
-                    <div class="column col-6 col-sm-12">
-                        <OriginXInput/>
-                    </div>
-                    <div class="column col-6 col-sm-12">
-                        <OriginYInput/>
-                    </div>
-                    <div class="column col-12">
+                <div class="settings-levels">
+                    <section class="settings-level">
+                        <div class="settings-level-heading"><span>{"1"}</span><div><h3>{"Global Process"}</h3><p>{"Applies to both the outer frame and imported SVG toolpaths."}</p></div></div>
+                        <div class="columns">
+                            <div class="column col-6 col-sm-12"><DwellSecondsInput/></div>
+                        </div>
+                    </section>
+
+                    <section class="settings-level">
+                        <div class="settings-level-heading"><span>{"2"}</span><div><h3>{"Imported SVG"}</h3><p>{"Controls the temperature, working height, and position of imported SVG toolpaths."}</p></div></div>
+                        <div class="columns">
+                            <div class="column col-6 col-sm-12"><SvgTemperatureInput/></div>
+                            <div class="column col-6 col-sm-12"><SvgWorkingHeightInput/></div>
+                            <div class="column col-12">
+                                <FormGroup>
+                                    <Checkbox
+                                        label="Automatically center imported SVG"
+                                        desc="Centers the bounding box of all effective toolpaths in each SVG at X=127.970, Y=127.970 without scaling or reordering paths."
+                                        checked={form_state.auto_center_svg}
+                                        onchange={on_auto_center_change}
+                                    />
+                                </FormGroup>
+                            </div>
+                        </div>
+                    </section>
+
+                    <section class="settings-level">
+                        <div class="settings-level-heading"><span>{"3"}</span><div><h3>{"Outer Sealing Frame"}</h3><p>{"Generated once before all SVG toolpaths and always centered on the machine center."}</p></div></div>
                         <FormGroup>
                             <Checkbox
-                                label="Enable circular interpolation"
-                                desc="Your machine must support G2/G3 commands for this to work"
-                                checked={form_state.circular_interpolation}
-                                onchange={on_circular_interpolation_change}
+                                label="Generate outer sealing frame"
+                                desc="Off by default. Starts at the lower-left corner and travels through lower-right, upper-right, upper-left, then closes at lower-left."
+                                checked={form_state.outer_frame_enabled}
+                                onchange={on_outer_frame_change}
                             />
                         </FormGroup>
-                    </div>
-                    <div class="column col-12">
-                        <FormGroup>
-                            <Checkbox
-                                label="Optimize path order (experimental)"
-                                desc="Reorder paths to minimize travel time. May be slow for SVGs with many elements."
-                                checked={form_state.optimize_path_order}
-                                onchange={on_optimize_path_order_change}
-                            />
-                        </FormGroup>
-                    </div>
-                    <div class="column col-12">
-                        <DpiInput/>
-                    </div>
-                    <div class="column col-12">
-                        <h3>{"Heat-seal output"}</h3>
-                        <p>{"These global parameters are applied to every independent SVG stroke."}</p>
-                    </div>
-                    <div class="column col-4 col-sm-12">
-                        <DwellSecondsInput/>
-                    </div>
-                    <div class="column col-4 col-sm-12">
-                        <TemperatureInput/>
-                    </div>
-                    <div class="column col-4 col-sm-12">
-                        <WorkingHeightInput/>
-                    </div>
-                    <div class="column col-12">
-                        <p class="text-gray">
-                            {"The Begin/End and Tool On/Off sequences below are saved for compatibility, but the web heat-seal download intentionally ignores them."}
-                        </p>
-                    </div>
-                    <div class="column col-12">
-                        <ToolOnSequenceInput/>
-                    </div>
-                    <div class="column col-12">
-                        <ToolOffSequenceInput/>
-                    </div>
-                    <div class="column col-12">
-                        <BeginSequenceInput/>
-                    </div>
-                    <div class="column col-12">
-                        <EndSequenceInput/>
-                    </div>
-                    <div class="column col-6 col-sm-12">
-                        <FormGroup>
-                            <Checkbox
-                                label="Generate checksums"
-                                desc="Useful when streaming g-code"
-                                checked={form_state.checksums}
-                                onchange={on_checksums_change}
-                            />
-                        </FormGroup>
-                    </div>
-                    <div class="column col-6 col-sm-12">
-                        <FormGroup>
-                            <Checkbox
-                                label="Generate line numbers"
-                                desc="Useful when streaming g-code or debugging"
-                                checked={form_state.line_numbers}
-                                onchange={on_line_numbers_change}
-                            />
-                        </FormGroup>
-                    </div>
-                    <div class="column col-6 col-sm-12">
-                        <FormGroup>
-                            <Checkbox
-                                label="Newline before comments"
-                                desc="Workaround for parsers that don't accept comments on the same line"
-                                checked={form_state.newline_before_comment}
-                                onchange={on_newline_before_comment_change}
-                            />
-                        </FormGroup>
-                    </div>
+                        <MachineWorkbench/>
+                        <div class="columns">
+                            <div class="column col-6 col-sm-12" key={format!("outer-width-{:?}", form_state.machine_model)}><OuterFrameWidthInput/></div>
+                            <div class="column col-6 col-sm-12" key={format!("outer-height-{:?}", form_state.machine_model)}><OuterFrameHeightInput/></div>
+                            <div class="column col-6 col-sm-12" key={format!("outer-temp-{}", form_state.outer_profile_sync_revision)}><OuterFrameTemperatureInput/></div>
+                            <div class="column col-6 col-sm-12" key={format!("outer-height-{}", form_state.outer_profile_sync_revision)}><OuterFrameWorkingHeightInput/></div>
+                        </div>
+                        <p class="text-gray">{"Changes to the SVG temperature or height are copied here. Changes made here do not affect the SVG settings."}</p>
+                    </section>
+
+                    <section class="settings-level settings-advanced">
+                        <button type="button" class="settings-advanced-toggle" onclick={advanced_toggle} aria-expanded={advanced_open.to_string()}>
+                            <span>{"4  Advanced Settings"}</span>
+                            <span>{if *advanced_open { "Collapse ▲" } else { "Expand ▼" }}</span>
+                        </button>
+                        {
+                            if *advanced_open {
+                                html! {
+                                    <div class="columns settings-advanced-body">
+                                        <div class="column col-4 col-sm-12"><FeedrateInput/></div>
+                                        <div class="column col-4 col-sm-12"><ToleranceInput/></div>
+                                        <div class="column col-4 col-sm-12"><DpiInput/></div>
+                                        <div class="column col-12"><p class="text-gray">{"Origin X/Y, circular interpolation, path optimization, machine sequences, line numbers, and checksums are fixed or removed. Values from older settings files cannot affect heat-seal output."}</p></div>
+                                    </div>
+                                }
+                            } else {
+                                html! {}
+                            }
+                        }
+                    </section>
                 </div>
             )}
             footer={
@@ -337,6 +256,7 @@ pub fn import_export_modal() -> Html {
                                             env!("CARGO_PKG_REPOSITORY")
                                     ))
                                 } else {
+                                    normalize_settings_for_web_heat_seal(&mut web_settings.settings);
                                     Ok(web_settings)
                                 })
                             );
@@ -693,7 +613,7 @@ pub fn marker_replacement_form() -> Html {
                 <FormGroup success={gcode_upload_state.as_ref().map(Result::is_ok)}>
                     <FileUpload<(), String>
                         label="Select one G-code template"
-                        desc="Exactly one line containing ‘标记’ will be replaced"
+                        desc="Exactly one designated marker line in the G-code file will be replaced"
                         accept=".gcode,.txt,text/plain"
                         multiple={false}
                         onchange={gcode_upload_onchange}

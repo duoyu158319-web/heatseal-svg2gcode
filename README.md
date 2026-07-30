@@ -12,6 +12,8 @@
 
 在线使用：<https://duoyu158319-web.github.io/heatseal-svg2gcode/>
 
+最新版本：[v2 更新说明](docs/RELEASE_NOTES_V2.md)
+
 ## 代码来源
 
 本项目基于 [sameer/svg2gcode](https://github.com/sameer/svg2gcode) 修改，沿用其 MIT License。原项目负责 SVG 解析、轨迹生成与通用 G-code 转换；本仓库在网页端增加了热封输出模板、多 SVG 合并以及模板标记替换功能。

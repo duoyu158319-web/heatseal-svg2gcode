@@ -4,7 +4,7 @@ const MARKER: &str = "标记";
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum MarkerReplaceError {
-    #[error("No line containing ‘标记’ was found in the G-code file")]
+    #[error("No designated marker line was found in the G-code file")]
     MarkerNotFound,
     #[error("Multiple marker lines were found at lines: {0}")]
     MultipleMarkers(String),

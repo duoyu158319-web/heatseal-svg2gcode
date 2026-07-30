@@ -2,8 +2,8 @@ use std::fmt::Display;
 
 use web_sys::{Event, FileList, HtmlInputElement, InputEvent, InputEventInit, MouseEvent};
 use yew::{
-    AttrValue, Callback, Children, Html, NodeRef, Properties, TargetCast, classes,
-    function_component, html, use_force_update, use_node_ref, use_state,
+    Callback, Children, Html, NodeRef, Properties, TargetCast, classes, function_component, html,
+    use_force_update, use_node_ref, use_state,
     virtual_dom::{VChild, VNode},
 };
 
@@ -64,6 +64,12 @@ where
     pub placeholder: Option<T>,
     #[prop_or_default]
     pub default: Option<T>,
+    #[prop_or_default]
+    pub min: Option<T>,
+    #[prop_or_default]
+    pub max: Option<T>,
+    #[prop_or_default]
+    pub step: Option<T>,
     #[prop_or(InputType::Text)]
     pub r#type: InputType,
     #[prop_or_default]
@@ -75,6 +81,7 @@ where
 css_class_enum! {
     InputType {
         Text => "text",
+        Number => "number",
         Url => "url"
     }
 }
@@ -136,7 +143,11 @@ where
             <div class={classes!(if props.button.is_some() { Some("input-group") } else { None })}>
                 <div class={classes!(if props.button.is_some() { Some("input-group") } else { None }, if success || error { Some("has-icon-right") } else { None })}>
                     <input id={id} class="form-input" type={props.r#type.to_string()} ref={node_ref.clone()}
-                        oninput={oninput} placeholder={ props.placeholder.as_ref().map(ToString::to_string) }
+                        oninput={oninput}
+                        placeholder={props.placeholder.as_ref().map(ToString::to_string)}
+                        min={props.min.as_ref().map(ToString::to_string)}
+                        max={props.max.as_ref().map(ToString::to_string)}
+                        step={props.step.as_ref().map(ToString::to_string)}
                     />
                     {
                         if let Some(parsed) = props.parsed.as_ref() {
@@ -338,111 +349,6 @@ pub fn form_group(props: &FormGroupProps) -> Html {
         )}>
             { for props.children.iter() }
         </div>
-    }
-}
-
-#[derive(Properties, PartialEq, Clone)]
-pub struct TextAreaProps<T, E>
-where
-    T: Display + Clone + PartialEq,
-    E: Display + Clone + PartialEq,
-{
-    pub label: &'static str,
-    pub desc: Option<&'static str>,
-    pub parsed: Option<Result<T, E>>,
-    #[prop_or_default]
-    pub placeholder: Option<AttrValue>,
-    pub default: Option<AttrValue>,
-    #[prop_or_default]
-    pub oninput: Callback<InputEvent>,
-    #[prop_or_default]
-    pub rows: Option<usize>,
-    #[prop_or_default]
-    pub cols: Option<usize>,
-}
-
-#[function_component(TextArea)]
-pub fn text_area<T, E>(props: &TextAreaProps<T, E>) -> Html
-where
-    T: Display + Clone + PartialEq,
-    E: Display + Clone + PartialEq,
-{
-    let success = props.parsed.as_ref().map(|x| x.is_ok()).unwrap_or(false);
-    let error = props.parsed.as_ref().map(|x| x.is_err()).unwrap_or(false);
-    let id = props.label.to_lowercase().replace(' ', "-");
-
-    // To properly set the default value, we need to force a second render
-    // so the noderef becomes valid.
-    let first_render = use_state(|| true);
-    let trigger = use_force_update();
-    let node_ref = use_node_ref();
-
-    if *first_render {
-        first_render.set(false);
-        trigger.force_update();
-    }
-
-    let user_edited = use_state(|| false);
-    let last_default_value = use_state(|| None);
-    if let Some(input_element) = node_ref.cast::<HtmlInputElement>() {
-        // Re-apply default if it changes
-        if !*user_edited && props.default != *last_default_value {
-            if let Some(d) = props.default.as_ref() {
-                input_element.set_value(d);
-            } else {
-                input_element.set_value("");
-            }
-            let init = InputEventInit::new();
-            init.set_data(Some("ignore"));
-            input_element
-                .dispatch_event(&InputEvent::new_with_event_init_dict("input", &init).unwrap())
-                .unwrap();
-            last_default_value.set(props.default.clone());
-        }
-    }
-
-    let prop_oninput = props.oninput.clone();
-    // Wrap callback to determine when user performed an edit
-    let oninput = Callback::from(move |event: InputEvent| {
-        if event.data().is_none_or(|d| d != "ignore") {
-            user_edited.set(true);
-        }
-        prop_oninput.emit(event);
-    });
-
-    html! {
-        <>
-            <label class="form-label" for={id.clone()}>
-                { props.label }
-            </label>
-            <div class={classes!(if success || error { Some("has-icon-right") } else { None })}>
-                <textarea class="form-input" id={id} oninput={oninput}
-                    ref={node_ref}
-                    placeholder={props.placeholder.as_ref().cloned()}
-                    rows={props.rows.as_ref().map(ToString::to_string)}
-                    cols={props.cols.as_ref().map(ToString::to_string)}
-                />
-                {
-                    if let Some(parsed) = props.parsed.as_ref() {
-                        match parsed {
-                            Ok(_) => html!(<Icon form=true name={IconName::Check}/>),
-                            Err(_) => html!(<Icon form=true name={IconName::Cross}/>)
-                        }
-                    } else {
-                        html!()
-                    }
-                }
-            </div>
-            {
-                if let Some(Err(err)) = props.parsed.as_ref() {
-                    html!{ <pre class="form-input-hint">{ err.to_string() }</pre> }
-                } else if let Some(desc) = props.desc {
-                    html! { <p class="form-input-hint">{ desc }</p> }
-                } else {
-                    html!()
-                }
-            }
-        </>
     }
 }
 
