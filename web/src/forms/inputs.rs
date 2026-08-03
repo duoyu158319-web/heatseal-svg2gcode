@@ -46,19 +46,19 @@ macro_rules! form_input {
 form_input! {
     Tolerance {
         "Curve tolerance (mm)",
-        "Lower values follow curves more closely but generate more G1 coordinate lines",
+        "Controls curve flattening and XY coordinate rounding. Smaller values can add more G1 segments on curves and increase coordinate precision; straight-line paths may remain unchanged",
         tolerance,
         settings.conversion.tolerance,
     }
     Feedrate {
         "Drawing feedrate (mm/min)",
-        "Sets the F value for outer-frame edges and SVG drawing commands",
+        "Sets F on outer-frame edges and imported SVG drawing moves. Fixed setup, travel, and height moves remain F1000",
         feedrate,
         settings.conversion.feedrate,
     }
     Dpi {
         "DPI",
-        "Controls conversion of visual SVG units such as px, pt, and pc into millimeters",
+        "Converts SVG pixel-based units such as px, pt, and pc into millimeters. Keep 96 for standard SVG files unless the source uses a different DPI",
         dpi,
         settings.conversion.inner.dpi,
     }

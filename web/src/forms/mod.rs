@@ -135,7 +135,7 @@ pub fn settings_form() -> Html {
                                         <div class="column col-4 col-sm-12"><FeedrateInput/></div>
                                         <div class="column col-4 col-sm-12"><ToleranceInput/></div>
                                         <div class="column col-4 col-sm-12"><DpiInput/></div>
-                                        <div class="column col-12"><p class="text-gray">{"Origin X/Y, circular interpolation, path optimization, machine sequences, line numbers, and checksums are fixed or removed. Values from older settings files cannot affect heat-seal output."}</p></div>
+                                        <div class="column col-12"><p class="text-gray">{"The web heat-seal workflow fixes Origin at X0/Y0, disables circular interpolation and path optimization, and ignores machine sequences, line numbers, and checksums. Imported settings may still change Feedrate, Curve tolerance, and DPI, but cannot override these fixed options."}</p></div>
                                     </div>
                                 }
                             } else {
